@@ -78,7 +78,7 @@ Build a **leakage-free**, **reproducible** forecasting pipeline that generalizes
 
 ---
 
-## Repository Structure (recommended)
+## Repository Structure
 
 ```text
 .
