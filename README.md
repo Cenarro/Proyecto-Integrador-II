@@ -28,8 +28,8 @@ Performance is measured using a **weighted RMSE skill score**:
 $$
 \text{Score} =
 \sqrt{
-  1 - \min\!\left(
-    \max\!\left(
+  1 - \min\left(
+    \max\left(
       \frac{\sum_{i \in I} w_i (y_i - \hat{y}_i)^2}
            {\sum_{i \in I} w_i y_i^2},
       0
