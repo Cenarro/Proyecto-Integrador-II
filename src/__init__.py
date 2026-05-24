@@ -1,1 +1,1 @@
-"""Kairos source package."""
+"""Kaggle hedge fund forecasting package."""

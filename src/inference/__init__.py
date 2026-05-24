@@ -1,1 +1,1 @@
-"""Inference and submission generation utilities."""
+from .predict import *

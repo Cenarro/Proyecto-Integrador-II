@@ -1,114 +1,81 @@
-# Kairos — Robust Multihorizon Time Series Forecasting (Proyecto Integrador II)
+# Hedge Fund Time Series Forecasting
 
-Kairos is a reproducible end-to-end forecasting pipeline designed for the Kaggle **Hedge Fund Time Series Forecasting** challenge. The project focuses on **multiseries, multihorizon forecasting** under **strict temporal constraints**, where predictions at time index `t` must only use data from indices `0..t` (no look-ahead, no leakage).
+Reproducible repository for the Kaggle hedge fund multihorizon forecasting competition. The main pipeline is a 2-level horizon-wise stack backed by a simpler LightGBM baseline workflow.
 
-The system includes:
-- A sequential data pipeline and temporal split generator
-- Strong baselines (naive / statistical / tree-based)
-- A global ML forecasting model for cross-series generalization
-- Rigorous temporal validation and diagnostics per horizon and group
-- Reproducibility tooling (pinned dependencies, fixed seeds, executable scripts)
+## What Is Included
 
----
+- 2-level horizon-wise architecture:
+  - level 1: LightGBM and XGBoost per horizon
+  - level 2: ridge calibrator/blender on top of level-1 predictions
+- strict time-based train/meta/eval segmentation
+- target encodings, interaction features, lag/rolling/EWM blocks, hierarchy-relative features, and cross-sectional normalization
+- schema validation and temporal split logic
+- LightGBM training with GPU fallback to CPU
+- walk-forward cross-validation and ablation support
+- submission generation from full-train refit
 
-## Project Context
+## Setup
 
-Forecasting systems often fail in real deployment because evaluation allows implicit leakage or does not reflect strict causality. This competition enforces sequential processing and evaluates performance mainly via a **private leaderboard**, promoting generalization beyond the training sample.
+Use the existing `dl` conda environment and install any missing dependencies:
 
-**Task:** Predict continuous values for each combination of:
-- `code`, `sub_code`, `sub_category`, `horizon`
-with strict chronological processing by `ts_index`.
+```bash
+conda activate dl
+pip install -r requirements.txt
+```
 
----
+The Kaggle parquet files are expected at:
 
-## Evaluation Metric
+```text
+src/data/train.parquet
+src/data/test.parquet
+```
 
-Performance is measured using a **weighted RMSE skill score**:
+These parquet files are tracked with Git LFS because they exceed GitHub's normal file-size limit. Generated outputs are ignored by git.
 
-$$
-\text{Score} =
-\sqrt{
-  1 - \min\left(
-    \max\left(
-      \frac{\sum_{i \in I} w_i (y_i - \hat{y}_i)^2}
-           {\sum_{i \in I} w_i y_i^2},
-      0
-    \right),
-    1
-  \right)
-}
-$$
+## Quick Start
 
+For a complete command-by-command guide, see [HOW_TO_RUN.md](HOW_TO_RUN.md).
 
-Where:
-- `I` = evaluation subset
-- `w_i` = observation weights
-- `y_i` = true values
-- `ŷ_i` = predictions
+Primary stacked submission:
 
----
+```bash
+python scripts/run_two_level_submission.py --output-dir outputs/predictions/2-level_submission
+```
 
-## Objectives
+Baseline workflows:
 
-### General objective
-Build a **leakage-free**, **reproducible** forecasting pipeline that generalizes out of sample across identifiers and horizons.
+```bash
+python scripts/run_baselines.py
+python scripts/run_cv.py --skip-final-fit
+python scripts/run_training.py --mode full
+python scripts/make_submission.py --validation-summary outputs/predictions/validation_summary_full.json
+```
 
-### Specific objectives
-- Implement sequential ingestion + temporal splits with strict causality
-- Establish baseline suite and benchmarking framework
-- Train a global ML model conditioned on horizon/groups
-- Implement temporal cross-validation + horizon-wise diagnostics
-- Run ablation studies (features, models, ensembling)
-- Deliver a fully reproducible package (pinned deps, seeds, scripts, protocols)
-
----
-
-## Scope
-
-### Included
-- Feature engineering under strict temporal constraints
-- Multihorizon training/inference with weighted metrics
-- Validation + diagnostics + ablation studies
-- Reproducibility package and Kaggle submission notebook
-
-### Excluded
-- Live trading execution and portfolio optimization
-- External private datasets not allowed by Kaggle rules
-- Any method violating sequential processing constraints
-
----
-
-## Repository Structure
+## Repository Layout
 
 ```text
 .
-├── README.md
-├── LICENSE
-├── requirements.txt
-├── .gitignore
-├── src/
-│   ├── data/                # ingestion, validation, split logic
-│   ├── features/            # lag/rolling/horizon/group features
-│   ├── models/              # baselines + ML models
-│   ├── metrics/             # weighted skill score implementation
-│   ├── training/            # train/validate loops, CV runner
-│   └── inference/           # submission generation, sequential predict
-├── scripts/
-│   ├── run_baselines.py
-│   ├── run_training.py
-│   ├── run_cv.py
-│   └── make_submission.py
-├── notebooks/
-│   ├── exploration.ipynb
-│   └── kaggle_submission.ipynb
-├── tests/
-│   ├── test_no_leakage.py
-│   ├── test_metric.py
-│   └── test_splits.py
-├── docs/
-│   ├── architecture.md
-│   ├── experiments.md
-│   └── ablations.md
-└── reports/
-    ├── proposal.pdf
-    └── final_report.pdf
+|-- README.md
+|-- LICENSE
+|-- requirements.txt
+|-- docs/
+|   |-- architecture.md
+|   |-- experiments.md
+|   `-- ablations.md
+|-- notebooks/
+|   |-- exploration.ipynb
+|   `-- kaggle_submission.ipynb
+|-- scripts/
+|   |-- run_two_level_submission.py
+|   |-- run_baselines.py
+|   |-- run_cv.py
+|   |-- run_training.py
+|   `-- make_submission.py
+`-- src/
+    |-- data/
+    |-- features/
+    |-- inference/
+    |-- metrics/
+    |-- models/
+    `-- training/
+```

@@ -28,9 +28,11 @@ logs/
 outputs/
 artifacts/
 checkpoints/
+reports/
 
 # Local datasets and exports
 *.parquet
+!src/data/*.parquet
 *.feather
 *.csv
 *.pkl

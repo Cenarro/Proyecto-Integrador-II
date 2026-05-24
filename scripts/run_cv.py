@@ -1,163 +1,179 @@
-"""Run leakage-safe temporal cross-validation for a global tree model."""
-
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
-import pandas as pd
-from tqdm import tqdm
-
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from training.competition_pipeline import (
-    build_model,
-    detect_schema,
-    ensure_dir,
-    fit_model,
-    fit_preprocessor,
-    load_table,
-    predict_model,
-    regression_metrics,
-    save_json,
-    split_from_window,
-    summarize_by_horizon,
-    temporal_cv_windows,
-    transform_with_preprocessor,
-)
+from src.data.splits import load_data, validate_schema
+from src.inference.predict import fit_predict_per_horizon_research_ensemble, write_submission
+from src.metrics.skill import weighted_rmse_score
+from src.training.config import LGBMConfig
+from src.training.validate import run_feature_ablation, run_per_horizon_walk_forward_cv
+
+
+def _parse_int_list(raw: str) -> list[int]:
+    return [int(x.strip()) for x in raw.split(',') if x.strip()]
+
+
+def _parse_str_list(raw: str) -> list[str]:
+    return [x.strip() for x in raw.split(',') if x.strip()]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--train-path", type=Path, default=ROOT / "train.parquet")
-    parser.add_argument(
-        "--output-dir", type=Path, default=ROOT / "outputs" / "cv_runs"
-    )
-    parser.add_argument(
-        "--model", choices=("lgbm", "xgb", "catboost"), default="lgbm"
-    )
-    parser.add_argument("--n-splits", type=int, default=3)
-    parser.add_argument("--val-size", type=int, default=180)
-    parser.add_argument("--min-train-size", type=int, default=2200)
-    parser.add_argument("--num-boost-round", type=int, default=600)
-    parser.add_argument("--early-stopping-rounds", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use-gpu", action="store_true")
-    parser.add_argument("--show-progress", action="store_true")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description='Run walk-forward CV for the per-horizon LightGBM baseline.')
+    p.add_argument('--train-path', type=Path, default=Path('src/data/train.parquet'))
+    p.add_argument('--test-path', type=Path, default=Path('src/data/test.parquet'))
+    p.add_argument('--predictions-dir', type=Path, default=Path('outputs/predictions'))
+    p.add_argument('--cv-folds', type=int, default=3)
+    p.add_argument('--cv-val-size', type=int, default=180)
+    p.add_argument('--cv-min-train-size', type=int, default=900)
+    p.add_argument('--objectives', type=str, default='regression,huber')
+    p.add_argument('--ensemble-seeds', type=str, default='42,143')
+    p.add_argument('--num-boost-round', type=int, default=1400)
+    p.add_argument('--early-stopping-rounds', type=int, default=120)
+    p.add_argument('--random-seed', type=int, default=42)
+    p.add_argument('--use-gpu', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--force-gpu', action='store_true')
+    p.add_argument('--progress', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--max-lag-cols', type=int, default=10)
+    p.add_argument('--max-cross-cols', type=int, default=6)
+    p.add_argument('--missing-indicator-threshold', type=float, default=0.2)
+    p.add_argument('--lags', type=str, default='1,2,3,5,10,20,40')
+    p.add_argument('--rolling-windows', type=str, default='5,10,20')
+    p.add_argument('--ewm-spans', type=str, default='5,10,20')
+    p.add_argument('--disable-lag-block', action='store_true')
+    p.add_argument('--disable-hierarchy-block', action='store_true')
+    p.add_argument('--disable-cross-block', action='store_true')
+    p.add_argument('--disable-missing-indicators', action='store_true')
+    p.add_argument('--run-ablation', action='store_true')
+    p.add_argument('--skip-final-fit', action='store_true')
+    return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = ensure_dir(args.output_dir)
+    args.predictions_dir.mkdir(parents=True, exist_ok=True)
+    train_df, test_df = load_data(args.train_path, args.test_path)
+    validate_schema(train_df, test_df)
 
-    df = load_table(args.train_path)
-    schema = detect_schema(df, require_target=True)
-    assert schema.target_col is not None
+    objectives = _parse_str_list(args.objectives)
+    seeds = _parse_int_list(args.ensemble_seeds)
+    lags = _parse_int_list(args.lags)
+    rolling_windows = _parse_int_list(args.rolling_windows)
+    ewm_spans = _parse_int_list(args.ewm_spans)
 
-    windows = temporal_cv_windows(
-        df[schema.ts_col].dropna().unique(),
-        n_splits=args.n_splits,
-        val_size=args.val_size,
-        min_train_size=args.min_train_size,
+    lgbm_cfg = LGBMConfig()
+    base_lgbm_params = dict(lgbm_cfg.params)
+    base_lgbm_params.update({
+        'learning_rate': 0.025,
+        'num_leaves': 72,
+        'min_child_samples': 260,
+        'feature_fraction': 0.68,
+        'bagging_fraction': 0.78,
+        'bagging_freq': 5,
+        'lambda_l1': 0.3,
+        'lambda_l2': 18.0,
+        'max_bin': 255,
+        'verbosity': -1,
+    })
+
+    if args.run_ablation:
+        ablation = run_feature_ablation(
+            train_df=train_work,
+            base_lgbm_params=base_lgbm_params,
+            objectives=objectives,
+            seeds=seeds,
+            n_folds=args.cv_folds,
+            val_size=args.cv_val_size,
+            min_train_size=args.cv_min_train_size,
+            num_boost_round=args.num_boost_round,
+            early_stopping_rounds=args.early_stopping_rounds,
+            use_gpu=args.use_gpu,
+            force_gpu=args.force_gpu,
+            random_seed=args.random_seed,
+            max_lag_cols=args.max_lag_cols,
+            max_cross_cols=args.max_cross_cols,
+            missing_indicator_threshold=args.missing_indicator_threshold,
+            lags=lags,
+            rolling_windows=rolling_windows,
+            ewm_spans=ewm_spans,
+            show_progress=args.progress,
+        )
+        (args.predictions_dir / 'ablation_summary_full.json').write_text(json.dumps(ablation, indent=2), encoding='utf-8')
+
+    outcome = run_per_horizon_walk_forward_cv(
+        train_df=train_df,
+        base_lgbm_params=base_lgbm_params,
+        objectives=objectives,
+        seeds=seeds,
+        n_folds=args.cv_folds,
+        val_size=args.cv_val_size,
+        min_train_size=args.cv_min_train_size,
+        num_boost_round=args.num_boost_round,
+        early_stopping_rounds=args.early_stopping_rounds,
+        use_gpu=args.use_gpu,
+        force_gpu=args.force_gpu,
+        random_seed=args.random_seed,
+        max_lag_cols=args.max_lag_cols,
+        max_cross_cols=args.max_cross_cols,
+        missing_indicator_threshold=args.missing_indicator_threshold,
+        lags=lags,
+        rolling_windows=rolling_windows,
+        ewm_spans=ewm_spans,
+        use_lag_block=not args.disable_lag_block,
+        use_hierarchy_block=not args.disable_hierarchy_block,
+        use_cross_section_block=not args.disable_cross_block,
+        use_missing_indicators=not args.disable_missing_indicators,
+        show_progress=args.progress,
     )
-
-    rows: list[dict[str, float | int | str]] = []
-    fold_iter = tqdm(windows, desc="cv folds", disable=not args.show_progress)
-    for window in fold_iter:
-        train_df, val_df = split_from_window(df, schema.ts_col, window)
-        for horizon in sorted(df[schema.horizon_col].dropna().unique()):
-            horizon = int(horizon)
-            train_h = train_df.loc[train_df[schema.horizon_col] == horizon].copy()
-            val_h = val_df.loc[val_df[schema.horizon_col] == horizon].copy()
-            if train_h.empty or val_h.empty:
-                continue
-
-            prepared = fit_preprocessor(train_h, schema)
-            X_train = prepared.frame[prepared.feature_cols]
-            X_val = transform_with_preprocessor(val_h, schema, prepared)
-            y_train = train_h[schema.target_col].to_numpy(dtype="float32")
-            y_val = val_h[schema.target_col].to_numpy(dtype="float32")
-            w_train = (
-                train_h[schema.weight_col].to_numpy(dtype="float32")
-                if schema.weight_col is not None
-                else None
-            )
-            w_val = (
-                val_h[schema.weight_col].to_numpy(dtype="float32")
-                if schema.weight_col is not None
-                else None
-            )
-
-            model = build_model(
-                args.model,
-                seed=args.seed + window.fold * 100 + horizon,
-                num_boost_round=args.num_boost_round,
-                use_gpu=args.use_gpu,
-                early_stopping_rounds=args.early_stopping_rounds,
-            )
-            model = fit_model(
-                model,
-                args.model,
-                X_train,
-                y_train,
-                w_train,
-                X_val=X_val,
-                y_val=y_val,
-                w_val=w_val,
-                categorical_cols=prepared.categorical_cols,
-                early_stopping_rounds=args.early_stopping_rounds,
-            )
-            preds = predict_model(model, X_val)
-            metrics = regression_metrics(y_val, preds, w_val)
-            rows.append(
-                {
-                    "model": args.model,
-                    "fold": window.fold,
-                    "horizon": horizon,
-                    "train_rows": int(len(train_h)),
-                    "val_rows": int(len(val_h)),
-                    "train_ts_max": window.train_ts_max,
-                    "val_ts_min": window.val_ts_min,
-                    "val_ts_max": window.val_ts_max,
-                    **metrics,
-                }
-            )
-
-    result_df = pd.DataFrame(rows).sort_values(["fold", "horizon"]).reset_index(drop=True)
-    summary_df = summarize_by_horizon(rows)
-    overall_df = (
-        result_df.groupby("model", as_index=False)[
-            ["weighted_score", "rmse", "mape", "ratio_sse_sst", "corr", "std_pred"]
-        ]
-        .mean(numeric_only=True)
+    outcome.cv_cache.write_csv(args.predictions_dir / 'cv_cache_per_horizon_full.csv')
+    summary = {
+        'mode': 'full',
+        'objectives': objectives,
+        'seeds': seeds,
+        'final_metric': outcome.final_metric,
+        'score_by_horizon': {str(k): v for k, v in outcome.score_by_horizon.items()},
+        'best_iterations': outcome.best_iterations,
+        'device_by_tag': outcome.device_by_tag,
+        'per_fold_metrics': outcome.per_fold_metrics,
+        'feature_config_by_horizon': outcome.feature_config_by_horizon,
+    }
+    summary_path = args.predictions_dir / 'validation_summary_full.json'
+    summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    print(f"final_metric = weighted_rmse_score(cv_cache['y'], cv_cache['pred'], cv_cache['wt']) = {outcome.final_metric:.8f}")
+    if args.skip_final_fit:
+        return
+    preds, fit_info = fit_predict_per_horizon_research_ensemble(
+        train_df=train_df,
+        test_df=test_df,
+        base_lgbm_params=base_lgbm_params,
+        objectives=objectives,
+        seeds=seeds,
+        best_iterations=outcome.best_iterations,
+        feature_config_by_horizon=outcome.feature_config_by_horizon,
+        use_gpu=args.use_gpu,
+        force_gpu=args.force_gpu,
+        random_seed=args.random_seed,
+        max_lag_cols=args.max_lag_cols,
+        max_cross_cols=args.max_cross_cols,
+        missing_indicator_threshold=args.missing_indicator_threshold,
+        lags=lags,
+        rolling_windows=rolling_windows,
+        ewm_spans=ewm_spans,
+        use_lag_block=not args.disable_lag_block,
+        use_hierarchy_block=not args.disable_hierarchy_block,
+        use_cross_section_block=not args.disable_cross_block,
+        use_missing_indicators=not args.disable_missing_indicators,
+        show_progress=args.progress,
     )
-
-    result_df.to_csv(output_dir / "cv_results.csv", index=False)
-    summary_df.to_csv(output_dir / "cv_summary_by_horizon.csv", index=False)
-    overall_df.to_csv(output_dir / "cv_summary_overall.csv", index=False)
-    save_json(
-        output_dir / "run_config.json",
-        {
-            "train_path": str(args.train_path),
-            "model": args.model,
-            "n_splits": args.n_splits,
-            "val_size": args.val_size,
-            "min_train_size": args.min_train_size,
-            "num_boost_round": args.num_boost_round,
-            "early_stopping_rounds": args.early_stopping_rounds,
-            "use_gpu": args.use_gpu,
-            "schema": schema.__dict__,
-            "folds": [window.__dict__ for window in windows],
-        },
-    )
-
-    print(summary_df.to_string(index=False))
+    write_submission(test_df, preds, args.predictions_dir / 'submission_per_horizon_full.csv')
+    (args.predictions_dir / 'final_fit_info_per_horizon_full.json').write_text(json.dumps(fit_info, indent=2), encoding='utf-8')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
