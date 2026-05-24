@@ -16,10 +16,7 @@ Reproducible repository for the Kaggle hedge fund multihorizon forecasting compe
 
 ## Setup
 
-Use the existing `dl` conda environment and install any missing dependencies:
-
 ```bash
-conda activate dl
 pip install -r requirements.txt
 ```
 
